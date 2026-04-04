@@ -1,0 +1,9 @@
+{
+  "name": "Dindi",
+  "telegram_chat_id": 0,
+  "plaud_token": "COLE_SEU_TOKEN_AQUI",
+  "plaud_origin": "https://api.plaud.ai",
+  "clients": [
+    "Interno"
+  ]
+}

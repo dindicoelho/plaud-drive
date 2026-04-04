@@ -1,0 +1,8 @@
+.env
+users/*
+!users/exemplo.json
+__pycache__/
+*.pyc
+.venv/
+bot.log
+nohup.out
