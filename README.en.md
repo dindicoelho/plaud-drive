@@ -7,10 +7,11 @@ Telegram bot that pulls your [Plaud](https://plaud.ai) recordings, generates str
 ## What it does
 
 1. You record meetings with Plaud as usual
-2. When you want to organize, send `/processar` on Telegram
-3. The bot pulls the past week's recordings, generates summaries, and suggests a folder for each one
-4. You confirm or correct with a tap
-5. Everything is saved to your Google Drive, organized by client
+2. **Every day at 9pm** the bot checks Plaud, generates summaries for new recordings, and sends you a Telegram message: *"🆕 3 meetings ready — /validar"*
+3. You send `/validar`, confirm or correct the folder/type of each one with a tap
+4. Everything is saved to your Google Drive, organized by client
+
+If you'd rather run it manually instead of waiting for 9pm, send `/processar` any time.
 
 There's also `/evolucao [client]` — it reads all summaries for a client and generates an analysis of how the project evolved over time. Works incrementally: the second time you run it, it reads the previous analysis + only the new notes.
 
@@ -189,7 +190,7 @@ source .venv/bin/activate
 python bot.py
 ```
 
-Open Telegram, send `/start` to your bot, then `/processar`.
+Open Telegram, send `/start` to your bot. From there, every day at 9pm it checks for new recordings and pings you to `/validar` — or send `/processar` right now to run on demand.
 
 ---
 
@@ -198,11 +199,23 @@ Open Telegram, send `/start` to your bot, then `/processar`.
 | Command | What it does |
 |---|---|
 | `/start` | Checks if your config is set up correctly |
-| `/processar` | Pulls recordings from the last 7 days and starts the flow |
-| `/processar 14` | Pulls from the last 14 days |
+| `/validar` | Opens meetings queued by the daily check |
+| `/processar` | Pulls the last 20 recordings right now (manual) |
+| `/processar 14` | Instead of the 20-recording cap, scans the last 14 days |
 | `/evolucao` | Lists available clients |
 | `/evolucao Client Name` | Generates (or updates) an evolution analysis for the client |
-| `/cancel` | Cancels the validation flow |
+| `/cancel` | Cancels the validation flow (pending queue is preserved — resume with `/validar`) |
+
+## Daily check
+
+Every day at 9pm (America/Sao_Paulo) the bot:
+
+1. Looks at the last 20 recordings on Plaud
+2. Filters out the ones it has already seen (state stored in `users/<name>_state.json`)
+3. Generates summaries with Claude and queues them in `pending`
+4. Sends you **one** grouped Telegram message — only if there's something new; otherwise stays quiet
+
+The pending queue survives a bot restart. `/cancel` mid-validation doesn't lose anything — `/validar` resumes where you left off.
 
 ---
 

@@ -7,10 +7,11 @@ Bot no Telegram que pega suas gravações do [Plaud](https://plaud.ai), gera res
 ## O que faz
 
 1. Você grava reuniões no Plaud normalmente
-2. Quando quiser organizar, manda `/processar` no Telegram
-3. O bot puxa as gravações da última semana, gera resumos e sugere a pasta de cada uma
-4. Você confirma ou corrige com um toque
-5. Tudo é salvo no seu Google Drive, organizado por cliente
+2. **Todo dia às 21h** o bot checa o Plaud, gera resumos das gravações novas, e te manda no Telegram: *"🆕 3 reuniões prontas — /validar"*
+3. Você manda `/validar`, confirma ou corrige a pasta/tipo de cada uma com um toque
+4. Tudo é salvo no seu Google Drive, organizado por cliente
+
+Se preferir rodar manualmente em vez de esperar 21h, manda `/processar` a qualquer hora.
 
 Também tem o `/evolucao [cliente]` — ele lê todos os resumos de um cliente e gera uma análise de como o projeto evoluiu ao longo do tempo. Funciona de forma incremental: na segunda vez que você pede, ele lê a análise anterior + só as notas novas.
 
@@ -189,7 +190,7 @@ source .venv/bin/activate
 python bot.py
 ```
 
-Abre o Telegram, manda `/start` pro seu bot, e depois `/processar`.
+Abre o Telegram, manda `/start` pro seu bot. A partir daí, todo dia às 21h ele checa as gravações novas e te avisa pra `/validar` — ou manda `/processar` agora pra rodar na hora.
 
 ---
 
@@ -198,11 +199,23 @@ Abre o Telegram, manda `/start` pro seu bot, e depois `/processar`.
 | Comando | O que faz |
 |---|---|
 | `/start` | Verifica se sua config tá ok |
-| `/processar` | Puxa gravações dos últimos 7 dias e inicia o fluxo |
-| `/processar 14` | Puxa dos últimos 14 dias |
+| `/validar` | Abre as reuniões engatilhadas pelo check diário |
+| `/processar` | Puxa as últimas 20 gravações agora (manual) |
+| `/processar 14` | Em vez do limite de 20, varre os últimos 14 dias |
 | `/evolucao` | Lista os clientes disponíveis |
 | `/evolucao Nome do Cliente` | Gera (ou atualiza) análise de evolução do cliente |
-| `/cancel` | Cancela o fluxo de validação |
+| `/cancel` | Cancela o fluxo de validação (o pending fica preservado pra retomar com `/validar`) |
+
+## Check diário
+
+Todo dia às 21h (America/Sao_Paulo) o bot:
+
+1. Olha as últimas 20 gravações no Plaud
+2. Filtra as que ele ainda não viu (estado guardado em `users/<nome>_state.json`)
+3. Gera resumos com Claude e enfileira em `pending`
+4. Te manda **uma** mensagem agrupada — só se houver gravação nova; senão fica quieto
+
+A fila pendente sobrevive a restart do bot. `/cancel` no meio da validação não perde nada — `/validar` retoma de onde parou.
 
 ---
 
