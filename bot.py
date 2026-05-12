@@ -1,11 +1,15 @@
+import fcntl
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+import sys
+from datetime import datetime, time as dt_time, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -17,14 +21,41 @@ from telegram.ext import (
 )
 
 from drive_client import DriveClient
-from models import ProcessedRecording
+from models import ProcessedRecording, Recording
 from plaud_client import PlaudClient
 from processor import Processor, TEMPLATES
 
+DAILY_CHECK_TZ = ZoneInfo("America/Sao_Paulo")
+DAILY_CHECK_TIME = dt_time(hour=21, minute=0, tzinfo=DAILY_CHECK_TZ)
+RECENT_FILES_LIMIT = 20
+
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+LOG_PATH = Path(__file__).parent / "bot.log"
+LOCK_PATH = Path("/tmp/plaud-drive.lock")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[
+        RotatingFileHandler(LOG_PATH, maxBytes=10_000_000, backupCount=3),
+        logging.StreamHandler(),
+    ],
+)
 logger = logging.getLogger(__name__)
+
+_lock_fd = None
+
+
+def acquire_singleton_lock():
+    global _lock_fd
+    _lock_fd = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(f"Outra instância já está rodando (lock {LOCK_PATH}). Saindo.")
+    _lock_fd.write(str(os.getpid()))
+    _lock_fd.flush()
 
 # States
 VALIDATING = 1
@@ -55,6 +86,78 @@ def get_user_clients(config: dict) -> list[str]:
     return config.get("clients", ["Interno"])
 
 
+def state_path(user_name: str) -> Path:
+    return USERS_DIR / f"{user_name.lower()}_state.json"
+
+
+def load_state(user_name: str) -> dict:
+    p = state_path(user_name)
+    if not p.exists():
+        return {"seen_ids": [], "pending": []}
+    with open(p) as f:
+        data = json.load(f)
+    data.setdefault("seen_ids", [])
+    data.setdefault("pending", [])
+    return data
+
+
+def save_state(user_name: str, state: dict):
+    with open(state_path(user_name), "w") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+
+
+def serialize_processed(p: ProcessedRecording) -> dict:
+    return {
+        "recording": {
+            "id": p.recording.id,
+            "title": p.recording.title,
+            "date": p.recording.date.isoformat(),
+            "duration_minutes": p.recording.duration_minutes,
+            "transcript": p.recording.transcript,
+            "has_summary": p.recording.has_summary,
+            "plaud_summary": p.recording.plaud_summary,
+        },
+        "summary_md": p.summary_md,
+        "suggested_client": p.suggested_client,
+        "rec_type": p.rec_type,
+        "validated_client": p.validated_client,
+        "validated_type": p.validated_type,
+    }
+
+
+def deserialize_processed(d: dict) -> ProcessedRecording:
+    r = d["recording"]
+    rec = Recording(
+        id=r["id"],
+        title=r["title"],
+        date=datetime.fromisoformat(r["date"]),
+        duration_minutes=r["duration_minutes"],
+        transcript=r["transcript"],
+        has_summary=r.get("has_summary", False),
+        plaud_summary=r.get("plaud_summary", ""),
+    )
+    return ProcessedRecording(
+        recording=rec,
+        summary_md=d["summary_md"],
+        suggested_client=d["suggested_client"],
+        rec_type=d.get("rec_type", "reuniao"),
+        validated_client=d.get("validated_client"),
+        validated_type=d.get("validated_type"),
+    )
+
+
+def iter_user_configs():
+    for f in USERS_DIR.glob("*.json"):
+        stem = f.stem
+        if stem == "exemplo" or stem.endswith("_state") or stem.endswith("_drive_creds"):
+            continue
+        try:
+            with open(f) as fp:
+                yield json.load(fp)
+        except Exception as e:
+            logger.warning(f"Falha ao ler {f.name}: {e}")
+
+
 # --- Command handlers ---
 
 
@@ -80,34 +183,54 @@ async def processar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Você não está configurada. Manda /start.")
         return ConversationHandler.END
 
-    # Parse período: /processar ou /processar 7 (dias) ou /processar 2026-03-01 2026-03-31
-    days = 7
+    # Parse período: /processar (tudo que ainda não foi visto) ou /processar 7 (dias)
     args = context.args or []
+    days: int | None = None
     if len(args) == 1 and args[0].isdigit():
         days = int(args[0])
-    # TODO: parse date range
 
-    since = datetime.now(timezone.utc) - timedelta(days=days)
+    state = load_state(config["name"])
+    seen = set(state["seen_ids"])
 
-    await update.message.reply_text(
-        f"⏳ Buscando gravações dos últimos {days} dias no Plaud..."
-    )
+    if days is not None:
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        await update.message.reply_text(
+            f"⏳ Buscando gravações dos últimos {days} dias no Plaud..."
+        )
+        max_files = None
+    else:
+        since = None
+        await update.message.reply_text(
+            f"⏳ Buscando as últimas {RECENT_FILES_LIMIT} gravações no Plaud..."
+        )
+        max_files = RECENT_FILES_LIMIT
 
     # Busca gravações
     try:
         plaud = PlaudClient(token=config["plaud_token"], origin=config.get("plaud_origin", "https://api.plaud.ai"))
-        recordings = plaud.get_recordings(since=since)
+        recordings = plaud.get_recordings(since=since, seen_ids=seen, max_files=max_files)
     except Exception as e:
         await update.message.reply_text(f"❌ Erro ao acessar Plaud: {e}")
         return ConversationHandler.END
 
     if not recordings:
-        await update.message.reply_text("Nenhuma gravação com transcrição encontrada nesse período.")
+        await update.message.reply_text("Nenhuma gravação com transcrição encontrada.")
         return ConversationHandler.END
 
+    new_recs = [r for r in recordings if r.id not in seen]
+    skipped = len(recordings) - len(new_recs)
+
+    if not new_recs:
+        await update.message.reply_text(
+            f"Todas as {len(recordings)} já foram vistas. Use /validar pra ver as engatilhadas."
+        )
+        return ConversationHandler.END
+
+    extra = f" ({skipped} já vistas, ignoradas)" if skipped else ""
     await update.message.reply_text(
-        f"📋 {len(recordings)} reuniões encontradas. Gerando resumos..."
+        f"📋 {len(new_recs)} reuniões novas{extra}. Gerando resumos..."
     )
+    recordings = new_recs
 
     # Processa com Claude
     try:
@@ -129,10 +252,15 @@ async def processar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Erro ao processar: {e}")
         return ConversationHandler.END
 
+    seen.update(p.recording.id for p in processed)
+    state["seen_ids"] = sorted(seen)
+    save_state(config["name"], state)
+
     # Salva no contexto pra validação
     context.user_data["processed"] = processed
     context.user_data["current_index"] = 0
     context.user_data["config"] = config
+    context.user_data["from_pending"] = False
 
     # Mostra o primeiro pra validar
     await show_recording_for_validation(update, context)
@@ -314,6 +442,12 @@ async def handle_new_client_name(update: Update, context: ContextTypes.DEFAULT_T
 async def finish_validation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     processed: list[ProcessedRecording] = context.user_data["processed"]
     config = context.user_data["config"]
+    from_pending = context.user_data.get("from_pending", False)
+
+    if from_pending:
+        state = load_state(config["name"])
+        state["pending"] = []
+        save_state(config["name"], state)
 
     # Filtra os que foram validados
     to_save = [p for p in processed if p.validated_client]
@@ -472,20 +606,121 @@ async def evolucao(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Erro: {e}")
 
 
+async def validar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    config = load_user_config(chat_id)
+    if not config:
+        await update.message.reply_text("Você não está configurada. Manda /start.")
+        return ConversationHandler.END
+
+    state = load_state(config["name"])
+    if not state["pending"]:
+        await update.message.reply_text(
+            "Nada engatilhado. O check diário roda às 21h, ou use /processar pra rodar manual."
+        )
+        return ConversationHandler.END
+
+    processed = [deserialize_processed(d) for d in state["pending"]]
+    context.user_data["processed"] = processed
+    context.user_data["current_index"] = 0
+    context.user_data["config"] = config
+    context.user_data["from_pending"] = True
+
+    await update.message.reply_text(f"📋 {len(processed)} reuniões pendentes.")
+    await show_recording_for_validation(update, context)
+    return VALIDATING
+
+
+async def daily_check(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("daily_check: iniciando varredura")
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        logger.warning("daily_check: ANTHROPIC_API_KEY ausente, pulando")
+        return
+
+    for config in iter_user_configs():
+        chat_id = config.get("telegram_chat_id")
+        plaud_token = config.get("plaud_token")
+        user_name = config.get("name")
+        if not (chat_id and plaud_token and user_name):
+            continue
+
+        state = load_state(user_name)
+        seen = set(state["seen_ids"])
+
+        try:
+            plaud = PlaudClient(
+                token=plaud_token,
+                origin=config.get("plaud_origin", "https://api.plaud.ai"),
+            )
+            recordings = plaud.get_recordings(seen_ids=seen, max_files=RECENT_FILES_LIMIT)
+        except Exception as e:
+            logger.warning(f"daily_check Plaud falhou para {user_name}: {e}")
+            continue
+
+        new_recs = [r for r in recordings if r.id not in seen]
+        if not new_recs:
+            logger.info(f"daily_check: {user_name} sem gravações novas")
+            continue
+
+        try:
+            processor = Processor(api_key=api_key)
+            clients = get_user_clients(config)
+            new_processed = [processor.process(r, clients) for r in new_recs]
+        except Exception as e:
+            logger.warning(f"daily_check Claude falhou para {user_name}: {e}")
+            continue
+
+        seen.update(r.id for r in new_recs)
+        state["seen_ids"] = sorted(seen)
+        state["pending"].extend(serialize_processed(p) for p in new_processed)
+        save_state(user_name, state)
+
+        count = len(new_processed)
+        total = len(state["pending"])
+        suffix = f" (total {total} pendentes)" if total != count else ""
+        try:
+            await context.bot.send_message(
+                chat_id,
+                f"🆕 {count} reunião{'ões' if count != 1 else ''} pronta{'s' if count != 1 else ''} pra validar{suffix} — /validar",
+            )
+        except Exception as e:
+            logger.warning(f"daily_check Telegram falhou para {user_name}: {e}")
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelado.")
     return ConversationHandler.END
 
 
+BOT_COMMANDS = [
+    BotCommand("start", "Verifica se sua config tá ok"),
+    BotCommand("validar", "Abre as reuniões engatilhadas pelo check diário"),
+    BotCommand("processar", "Roda agora nas últimas 20 gravações (ou /processar N pra olhar N dias)"),
+    BotCommand("evolucao", "Análise de evolução de um cliente"),
+    BotCommand("cancel", "Cancela o fluxo de validação"),
+]
+
+
+async def post_init(app: Application):
+    await app.bot.set_my_commands(BOT_COMMANDS)
+    logger.info(f"Comandos registrados no Telegram: {[c.command for c in BOT_COMMANDS]}")
+
+
 def main():
+    acquire_singleton_lock()
+
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN não encontrado no .env")
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(post_init).build()
 
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("processar", processar)],
+        entry_points=[
+            CommandHandler("processar", processar),
+            CommandHandler("validar", validar),
+        ],
         states={
             VALIDATING: [CallbackQueryHandler(handle_validation, pattern=r"^(confirm|change|changetype|skip):")],
             CHOOSING_CLIENT: [CallbackQueryHandler(handle_choose_client, pattern=r"^setclient:")],
@@ -498,6 +733,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("evolucao", evolucao))
+
+    app.job_queue.run_daily(daily_check, time=DAILY_CHECK_TIME, name="daily_plaud_check")
+    logger.info(f"daily_check agendado para {DAILY_CHECK_TIME}")
 
     logger.info("Bot rodando...")
     app.run_polling()

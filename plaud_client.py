@@ -75,14 +75,21 @@ class PlaudClient:
         data = self._raw_request("GET", f"/file/simple/web?{params}")
         return data.get("data_file_list", [])
 
-    def list_all_files(self, since: datetime | None = None) -> list[dict]:
-        """Lista todas as gravações, com paginação. Filtra por data se `since` fornecido."""
+    def list_all_files(
+        self,
+        since: datetime | None = None,
+        max_files: int | None = None,
+    ) -> list[dict]:
+        """Lista gravações, com paginação. Filtra por data se `since` fornecido.
+
+        Se `max_files` for passado, para quando alcançar essa quantidade.
+        """
         all_files = []
         skip = 0
-        limit = 50
+        page = 50
 
         while True:
-            batch = self.list_files(skip=skip, limit=limit)
+            batch = self.list_files(skip=skip, limit=page)
             if not batch:
                 break
 
@@ -91,10 +98,12 @@ class PlaudClient:
                 if since and file_date and file_date < since:
                     return all_files
                 all_files.append(f)
+                if max_files is not None and len(all_files) >= max_files:
+                    return all_files
 
-            if len(batch) < limit:
+            if len(batch) < page:
                 break
-            skip += limit
+            skip += page
 
         return all_files
 
@@ -141,13 +150,24 @@ class PlaudClient:
 
         return ""
 
-    def get_recordings(self, since: datetime | None = None) -> list[Recording]:
-        """Retorna gravações como objetos Recording com transcrição."""
-        files = self.list_all_files(since=since)
+    def get_recordings(
+        self,
+        since: datetime | None = None,
+        seen_ids: set[str] | None = None,
+        max_files: int | None = None,
+    ) -> list[Recording]:
+        """Retorna gravações como objetos Recording com transcrição.
+
+        Se `seen_ids` for passado, pula gravações já vistas (sem buscar transcrição).
+        Se `max_files` for passado, limita a varredura às N gravações mais recentes.
+        """
+        files = self.list_all_files(since=since, max_files=max_files)
         recordings = []
 
         for f in files:
             file_id = f.get("id", "")
+            if seen_ids and file_id in seen_ids:
+                continue
             if not f.get("is_trans", False):
                 continue  # Pula gravações sem transcrição
 
