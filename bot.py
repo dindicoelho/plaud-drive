@@ -1,3 +1,4 @@
+import asyncio
 import fcntl
 import json
 import logging
@@ -10,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -19,20 +21,26 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
+from agent import ChatAgent
 from drive_client import DriveClient
 from models import ProcessedRecording, Recording
 from plaud_client import PlaudClient
 from processor import Processor, TEMPLATES
 
+load_dotenv()
+
 DAILY_CHECK_TZ = ZoneInfo("America/Sao_Paulo")
 DAILY_CHECK_TIME = dt_time(hour=21, minute=0, tzinfo=DAILY_CHECK_TZ)
 RECENT_FILES_LIMIT = 20
 
-load_dotenv()
-
-LOG_PATH = Path(__file__).parent / "bot.log"
-LOCK_PATH = Path("/tmp/plaud-drive.lock")
+BASE_DIR = Path(__file__).parent
+USERS_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "users"))
+LOG_PATH = Path(os.getenv("LOG_PATH", BASE_DIR / "bot.log"))
+LOCK_PATH = Path(os.getenv("LOCK_PATH", "/tmp/plaud-drive.lock"))
+USERS_DIR.mkdir(parents=True, exist_ok=True)
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,7 +71,19 @@ CHOOSING_CLIENT = 2
 NEW_CLIENT_NAME = 3
 CHOOSING_TYPE = 4
 
-USERS_DIR = Path(__file__).parent / "users"
+
+async def safe_send(send_func, *args, **kwargs):
+    """Wrap reply_text/send_message com retry simples em falhas de rede."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            return await send_func(*args, **kwargs)
+        except (NetworkError, TimedOut) as e:
+            last_err = e
+            wait = 2 ** attempt
+            logger.warning(f"Telegram send falhou ({type(e).__name__}: {e}), retry em {wait}s")
+            await asyncio.sleep(wait)
+    raise last_err
 
 
 def load_user_config(chat_id: int) -> dict | None:
@@ -166,7 +186,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = load_user_config(chat_id)
     if config:
         await update.message.reply_text(
-            f"Oi {config['name']}! Manda /processar pra começar."
+            f"Oi {config['name']}! Pode me mandar mensagem natural tipo:\n"
+            "• 'o que tem novo?'\n"
+            "• 'processa a reunião de ontem e salva no Ininterrupta'\n"
+            "• 'faz a evolução do Interno'\n\n"
+            "Ou usa os comandos: /processar, /validar, /evolucao, /reset (limpa histórico do chat)."
         )
     else:
         await update.message.reply_text(
@@ -174,6 +198,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Pede pra quem configura o sistema adicionar seu chat_id "
             "no arquivo de config em users/."
         )
+
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.chat_data.pop("history", None)
+    context.chat_data.pop("drafts", None)
+    await update.message.reply_text("Histórico zerado. 🧹")
 
 
 async def processar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -688,9 +718,295 @@ async def daily_check(context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"daily_check Telegram falhou para {user_name}: {e}")
 
 
+def _build_recording_from_detail(plaud: PlaudClient, file_id: str) -> Recording:
+    detail = plaud.get_file_detail(file_id)
+    transcript = plaud.get_transcript(file_id)
+    if not transcript:
+        raise ValueError(f"Gravação {file_id} sem transcrição disponível")
+    ts = detail.get("start_time")
+    if ts:
+        ts = int(ts)
+        if ts >= 1_000_000_000_000:
+            ts = ts / 1000
+        date = datetime.fromtimestamp(ts, tz=timezone.utc)
+    else:
+        date = datetime.now(timezone.utc)
+    duration_ms = detail.get("duration", 0)
+    duration_min = duration_ms // 60_000 if duration_ms >= 60_000 else max(duration_ms // 1000 // 60, 1)
+    return Recording(
+        id=file_id,
+        title=detail.get("filename") or detail.get("title") or "Sem título",
+        date=date,
+        duration_minutes=max(duration_min, 1),
+        transcript=transcript,
+        has_summary=detail.get("is_summary", False),
+    )
+
+
+def _ensure_drive_root(config: dict, drive: DriveClient) -> str:
+    root_id = config.get("drive_root_folder_id")
+    if not root_id:
+        plaud_drive_id = drive.get_or_create_folder("plaud-drive")
+        root_id = drive.get_or_create_folder("Reuniões", parent_id=plaud_drive_id)
+        config["drive_root_folder_id"] = root_id
+        save_user_config(config)
+    return root_id
+
+
+def make_tool_runner(config: dict, drafts: dict, api_key: str):
+    """Cria o runner síncrono que o ChatAgent vai chamar."""
+    plaud = PlaudClient(
+        token=config["plaud_token"],
+        origin=config.get("plaud_origin", "https://api.plaud.ai"),
+    )
+    processor = Processor(api_key=api_key)
+    user_name = config["name"]
+
+    def _drive() -> DriveClient:
+        return DriveClient(str(USERS_DIR / f"{user_name.lower()}_drive_creds.json"))
+
+    def run(name: str, args: dict):
+        if name == "list_recent_recordings":
+            limit = args.get("limit", RECENT_FILES_LIMIT)
+            days = args.get("days")
+            include_seen = args.get("include_seen", False)
+            since = datetime.now(timezone.utc) - timedelta(days=days) if days else None
+            state = load_state(user_name)
+            seen = set() if include_seen else set(state["seen_ids"])
+            recs = plaud.get_recordings(since=since, seen_ids=seen, max_files=limit)
+            return {
+                "count": len(recs),
+                "recordings": [
+                    {
+                        "id": r.id,
+                        "title": r.title,
+                        "date": r.date.strftime("%Y-%m-%d %H:%M"),
+                        "duration_minutes": r.duration_minutes,
+                    }
+                    for r in recs
+                ],
+            }
+
+        if name == "process_recording":
+            rec_id = args["recording_id"]
+            rec = _build_recording_from_detail(plaud, rec_id)
+            clients = get_user_clients(config)
+            processed = processor.process(rec, clients)
+            drafts[rec_id] = processed
+            type_info = TEMPLATES.get(processed.rec_type, TEMPLATES["reuniao"])
+            return {
+                "recording_id": rec_id,
+                "title": rec.title,
+                "date": rec.date.strftime("%Y-%m-%d"),
+                "duration_minutes": rec.duration_minutes,
+                "suggested_type": processed.rec_type,
+                "type_label": type_info["label"],
+                "suggested_client": processed.suggested_client,
+                "summary_preview": processed.summary_md[:400] + ("..." if len(processed.summary_md) > 400 else ""),
+            }
+
+        if name == "save_to_drive":
+            rec_id = args["recording_id"]
+            client_name = args["client"]
+            rec_type = args.get("rec_type")
+            draft = drafts.get(rec_id)
+            if not draft:
+                return {"error": f"Draft {rec_id} não está em memória. Processe primeiro com process_recording."}
+            draft.validated_client = client_name
+            if rec_type:
+                draft.validated_type = rec_type
+            if client_name not in get_user_clients(config):
+                config.setdefault("clients", ["Interno"]).append(client_name)
+                save_user_config(config)
+            drive = _drive()
+            root_id = _ensure_drive_root(config, drive)
+            client_folder_id = drive.get_or_create_folder(client_name, parent_id=root_id)
+            file_id = drive.upload_markdown(draft.filename, draft.summary_md, client_folder_id)
+            state = load_state(user_name)
+            seen = set(state["seen_ids"])
+            seen.add(rec_id)
+            state["seen_ids"] = sorted(seen)
+            save_state(user_name, state)
+            return {
+                "saved": True,
+                "drive_file_id": file_id,
+                "filename": draft.filename,
+                "client": client_name,
+            }
+
+        if name == "list_clients":
+            return {"clients": get_user_clients(config)}
+
+        if name == "register_client":
+            new_name = args["name"].strip()
+            clients = config.setdefault("clients", ["Interno"])
+            if new_name in clients:
+                return {"already_exists": True, "client": new_name}
+            clients.append(new_name)
+            save_user_config(config)
+            return {"registered": True, "client": new_name}
+
+        if name == "list_pending":
+            state = load_state(user_name)
+            pending = state.get("pending", [])
+            return {
+                "count": len(pending),
+                "pending": [
+                    {
+                        "index": i,
+                        "recording_id": p["recording"]["id"],
+                        "title": p["recording"]["title"],
+                        "date": p["recording"]["date"][:10],
+                        "suggested_type": p.get("rec_type", "reuniao"),
+                        "suggested_client": p["suggested_client"],
+                    }
+                    for i, p in enumerate(pending)
+                ],
+            }
+
+        if name == "save_pending":
+            idx = args["pending_index"]
+            client_name = args["client"]
+            rec_type = args.get("rec_type")
+            state = load_state(user_name)
+            pending = state.get("pending", [])
+            if not 0 <= idx < len(pending):
+                return {"error": f"pending_index {idx} fora do intervalo (0..{len(pending)-1})"}
+            draft = deserialize_processed(pending[idx])
+            draft.validated_client = client_name
+            if rec_type:
+                draft.validated_type = rec_type
+            if client_name not in get_user_clients(config):
+                config.setdefault("clients", ["Interno"]).append(client_name)
+                save_user_config(config)
+            drive = _drive()
+            root_id = _ensure_drive_root(config, drive)
+            client_folder_id = drive.get_or_create_folder(client_name, parent_id=root_id)
+            file_id = drive.upload_markdown(draft.filename, draft.summary_md, client_folder_id)
+            pending.pop(idx)
+            state["pending"] = pending
+            save_state(user_name, state)
+            return {
+                "saved": True,
+                "drive_file_id": file_id,
+                "filename": draft.filename,
+                "client": client_name,
+                "remaining_pending": len(pending),
+            }
+
+        if name == "generate_evolution":
+            client_name = args["client"]
+            drive = _drive()
+            root_id = _ensure_drive_root(config, drive)
+            client_folder_id = drive.get_or_create_folder(client_name, parent_id=root_id)
+            files = drive.list_files_in_folder(client_folder_id)
+            evolution_files = sorted(
+                [f for f in files if f["name"].startswith("_evolucao_") and f["name"].endswith(".md")],
+                key=lambda x: x["name"],
+            )
+            note_files = sorted(
+                [f for f in files if f["name"].endswith(".md") and not f["name"].startswith("_")],
+                key=lambda x: x["name"],
+            )
+            if not note_files:
+                return {"error": f"Nenhuma nota encontrada para {client_name}."}
+            last_evolution = None
+            new_notes = note_files
+            if evolution_files:
+                last_evo = evolution_files[-1]
+                last_evolution = drive.read_file(last_evo["id"])
+                date_part = last_evo["name"].replace("_evolucao_", "").replace(".md", "")
+                new_notes = [f for f in note_files if f["name"][:10] > date_part]
+                if not new_notes:
+                    return {"info": f"Nenhuma nota nova desde a última evolução ({date_part})."}
+            summaries = [drive.read_file(f["id"]) for f in new_notes]
+            evolution = processor.generate_evolution(client_name, summaries, previous_evolution=last_evolution)
+            today = datetime.now().strftime("%Y-%m-%d")
+            drive.upload_markdown(f"_evolucao_{today}.md", evolution, client_folder_id)
+            return {
+                "client": client_name,
+                "notes_analyzed": len(new_notes),
+                "saved_as": f"_evolucao_{today}.md",
+                "evolution": evolution,
+            }
+
+        return {"error": f"Tool desconhecida: {name}"}
+
+    return run
+
+
+async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    config = load_user_config(chat_id)
+    if not config:
+        await update.message.reply_text("Você não está configurada. Manda /start.")
+        return
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        await update.message.reply_text("⚠️ ANTHROPIC_API_KEY não configurada no servidor.")
+        return
+
+    history = context.chat_data.setdefault("history", [])
+    drafts = context.chat_data.setdefault("drafts", {})
+    user_msg = update.message.text
+
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    except Exception:
+        pass
+
+    runner = make_tool_runner(config, drafts, api_key)
+    agent = ChatAgent(api_key=api_key, runner=runner)
+
+    try:
+        reply, new_history = await asyncio.to_thread(agent.respond, user_msg, history)
+    except Exception as e:
+        logger.exception("agent error")
+        await update.message.reply_text(f"⚠️ Erro no agente: {type(e).__name__}: {e}")
+        return
+
+    if len(new_history) > 40:
+        new_history = new_history[-30:]
+    context.chat_data["history"] = new_history
+
+    for i in range(0, len(reply), 4000):
+        try:
+            await safe_send(update.message.reply_text, reply[i:i+4000], parse_mode="Markdown")
+        except Exception:
+            await safe_send(update.message.reply_text, reply[i:i+4000])
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelado.")
     return ConversationHandler.END
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    logger.exception("Exceção no handler:", exc_info=err)
+
+    chat_id = None
+    if isinstance(update, Update) and update.effective_chat:
+        chat_id = update.effective_chat.id
+
+    if not chat_id:
+        return
+
+    err_name = type(err).__name__
+    err_msg = str(err) or err_name
+    if len(err_msg) > 300:
+        err_msg = err_msg[:300] + "..."
+
+    if isinstance(err, (NetworkError, TimedOut)):
+        text = f"⚠️ Rede instável agora ({err_name}). Tenta de novo em alguns segundos."
+    else:
+        text = f"⚠️ Deu erro: `{err_name}: {err_msg}`\n\nTenta de novo, ou /cancel se travou."
+
+    try:
+        await safe_send(context.bot.send_message, chat_id=chat_id, text=text, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"Não consegui avisar o usuário sobre o erro: {e}")
 
 
 BOT_COMMANDS = [
@@ -698,6 +1014,7 @@ BOT_COMMANDS = [
     BotCommand("validar", "Abre as reuniões engatilhadas pelo check diário"),
     BotCommand("processar", "Roda agora nas últimas 20 gravações (ou /processar N pra olhar N dias)"),
     BotCommand("evolucao", "Análise de evolução de um cliente"),
+    BotCommand("reset", "Limpa o histórico do chat com o agente"),
     BotCommand("cancel", "Cancela o fluxo de validação"),
 ]
 
@@ -714,7 +1031,27 @@ def main():
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN não encontrado no .env")
 
-    app = Application.builder().token(token).post_init(post_init).build()
+    request = HTTPXRequest(
+        connect_timeout=20.0,
+        read_timeout=30.0,
+        write_timeout=20.0,
+        pool_timeout=10.0,
+    )
+    get_updates_request = HTTPXRequest(
+        connect_timeout=20.0,
+        read_timeout=40.0,
+        write_timeout=20.0,
+        pool_timeout=10.0,
+    )
+
+    app = (
+        Application.builder()
+        .token(token)
+        .request(request)
+        .get_updates_request(get_updates_request)
+        .post_init(post_init)
+        .build()
+    )
 
     conv_handler = ConversationHandler(
         entry_points=[
@@ -731,11 +1068,19 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("reset", reset))
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("evolucao", evolucao))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
+    app.add_error_handler(on_error)
 
-    app.job_queue.run_daily(daily_check, time=DAILY_CHECK_TIME, name="daily_plaud_check")
-    logger.info(f"daily_check agendado para {DAILY_CHECK_TIME}")
+    app.job_queue.run_daily(
+        daily_check,
+        time=DAILY_CHECK_TIME,
+        name="daily_plaud_check",
+        job_kwargs={"misfire_grace_time": 6 * 3600, "coalesce": True},
+    )
+    logger.info(f"daily_check agendado para {DAILY_CHECK_TIME} (misfire_grace=6h, coalesce=True)")
 
     logger.info("Bot rodando...")
     app.run_polling()
