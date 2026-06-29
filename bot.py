@@ -1065,6 +1065,7 @@ def main():
             CHOOSING_TYPE: [CallbackQueryHandler(handle_choose_type, pattern=r"^settype:")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
     app.add_handler(CommandHandler("start", start))
